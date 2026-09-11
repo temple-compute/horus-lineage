@@ -1,0 +1,594 @@
+#
+# horus-lineage
+# Copyright (C) 2026 QuietFlare
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+"""
+Recording a real run, which is the only way to exercise the middlewares.
+
+Each test runs a two-task workflow on the local target and reads the
+records back, so the assertions are about files on disk rather than about
+the recorder's internals.
+"""
+
+import asyncio
+import hashlib
+import json
+from pathlib import Path
+from typing import Any
+
+import pytest
+from horus_runtime.core.task.exceptions import TaskExecutionError
+from horus_runtime.core.workflow.base import BaseWorkflow
+
+from horus_lineage import conformance
+from horus_lineage.config import ENV_COMMAND
+
+WORKFLOW = """
+kind: horus_workflow
+name: Recording probe
+tasks:
+  - kind: horus_task
+    id: prep
+    name: Prepare
+    inputs:
+      - {id: items, name: Items, kind: file, path: items.txt}
+    outputs:
+      - {id: prepared, name: Prepared, kind: file, path: prepared.txt}
+    executor: {kind: shell}
+    runtime:
+      kind: python_script
+      script: prep.py
+      python: python3
+      args: --items ${items} --out ${prepared}
+    target: {kind: local}
+
+  - kind: horus_task
+    id: report
+    name: Report
+    inputs:
+      - {id: prepared, name: Prepared, kind: file, path: prepared.txt}
+    outputs:
+      - {id: report, name: Report, kind: file, path: report.txt}
+    executor: {kind: shell}
+    runtime: {kind: command, command: "wc -l < $prepared > $report"}
+    target: {kind: local}
+
+edges:
+  - source: prep
+    source_output: prepared
+    target: report
+    target_input: prepared
+
+orchestrator_target:
+  kind: local
+  working_directory: results
+"""
+
+PREP_SCRIPT = """\
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--items", required=True)
+parser.add_argument("--out", required=True)
+args = parser.parse_args()
+
+with open(args.out, "w") as handle:
+    handle.write(open(args.items).read().upper())
+"""
+
+SHA256_HEX = 64
+EXPECTED_RUNS = 2
+
+
+@pytest.fixture
+def project(tmp_path: Path) -> Path:
+    """
+    A workflow directory the tests can run and edit.
+    """
+    (tmp_path / "workflow.yaml").write_text(WORKFLOW)
+    (tmp_path / "prep.py").write_text(PREP_SCRIPT)
+    (tmp_path / "items.txt").write_text("alpha\nbeta\n")
+    return tmp_path
+
+
+async def run_workflow(project: Path) -> None:
+    """
+    Run the probe workflow once, as the CLI would.
+    """
+    workflow = BaseWorkflow.from_yaml(project / "workflow.yaml")
+    await workflow.run(trigger_id="prep")
+
+
+def runs(records_dir: Path) -> list[Path]:
+    """
+    Every run directory written so far, oldest first.
+    """
+    return sorted(records_dir.iterdir(), key=lambda p: p.stat().st_mtime)
+
+
+def record(run: Path, task_id: str) -> dict[str, Any]:
+    """
+    One task's record, found by the id it describes.
+    """
+    for path in run.glob(f"{task_id}.*.json"):
+        parsed: dict[str, Any] = json.loads(path.read_text())
+        return parsed
+    raise AssertionError(f"no record for {task_id} in {run}")
+
+
+def plan(run: Path) -> dict[str, Any]:
+    """
+    The run's own record.
+    """
+    parsed: dict[str, Any] = json.loads((run / "run.json").read_text())
+    return parsed
+
+
+@pytest.mark.usefixtures("horus_context", "init_registry")
+class TestTheFormatIsHonoured:
+    """
+    The recorder held to its own published contract.
+
+    The unit tests check the suite against hand-built records. This
+    checks the records the recorder actually writes, which is the pair
+    that matters: a suite that drifts from the recorder proves nothing,
+    and a recorder that drifts from the suite breaks every reader.
+    """
+
+    async def test_an_executed_run_conforms(
+        self, project: Path, records_dir: Path
+    ) -> None:
+        """
+        The ordinary case, digests and all.
+        """
+        await run_workflow(project)
+        assert conformance.check_run(runs(records_dir)[0]) == []
+
+    async def test_a_cached_run_conforms(
+        self, project: Path, records_dir: Path
+    ) -> None:
+        """
+        A re-run is mostly skips, and a confirmed skip records in full.
+        This is where a reader's chain would break first.
+        """
+        await run_workflow(project)
+        await run_workflow(project)
+        assert conformance.check_run(runs(records_dir)[-1]) == []
+
+
+@pytest.mark.usefixtures("horus_context", "init_registry")
+class TestAFreshRun:
+    """
+    What a run that executes everything leaves behind.
+    """
+
+    async def test_it_writes_a_record_per_task_plus_the_plan(
+        self, project: Path, records_dir: Path
+    ) -> None:
+        """
+        The run directory is the unit.
+        """
+        await run_workflow(project)
+        run = runs(records_dir)[0]
+        assert {p.name for p in run.iterdir()} >= {
+            "run.json",
+            "definition.json",
+        }
+        assert record(run, "prep")["task"]["status"] == "completed"
+        assert record(run, "report")["task"]["status"] == "completed"
+
+    async def test_the_plan_closes_with_the_real_outcome(
+        self, project: Path, records_dir: Path
+    ) -> None:
+        """
+        The status is derived, because the workflow assigns its own
+        after the middleware chain returns.
+        """
+        await run_workflow(project)
+        closed = plan(runs(records_dir)[0])
+        assert closed["status"] == "completed"
+        assert closed["finished_at"] is not None
+
+    async def test_every_task_cites_the_definition_it_ran_under(
+        self, project: Path, records_dir: Path
+    ) -> None:
+        """
+        A mismatched plan is detected, not silently joined.
+        """
+        await run_workflow(project)
+        run = runs(records_dir)[0]
+        expected = plan(run)["definition"]["sha256"]
+        assert record(run, "prep")["definition_sha256"] == expected
+
+    async def test_outputs_carry_digests_that_match_the_bytes(
+        self, project: Path, records_dir: Path
+    ) -> None:
+        """
+        A digest that does not match the file is worse than none.
+        """
+        await run_workflow(project)
+        output = record(runs(records_dir)[0], "prep")["outputs"][0]
+        on_disk = Path(output["path"]).read_bytes()
+        assert output["sha256"] == hashlib.sha256(on_disk).hexdigest()
+
+    async def test_the_resolved_command_is_captured(
+        self, project: Path, records_dir: Path
+    ) -> None:
+        """
+        The runtime middleware exists to substitute the templates.
+        """
+        await run_workflow(project)
+        command = record(runs(records_dir)[0], "prep")["command"]
+        assert command is not None
+        assert "${" not in command
+
+    async def test_the_environment_digests_identify_the_task(
+        self, project: Path, records_dir: Path
+    ) -> None:
+        """
+        Naming the cause of a change needs the parts kept separate.
+        """
+        await run_workflow(project)
+        environment = record(runs(records_dir)[0], "prep")["environment"]
+        assert environment["executor"]["kind"] == "shell"
+        assert environment["runtime"]["kind"] == "python_script"
+        assert len(environment["config_sha256"]) == SHA256_HEX
+
+    async def test_a_referenced_script_is_digested(
+        self, project: Path, records_dir: Path
+    ) -> None:
+        """
+        The engine's fingerprint cannot see script bytes, so this is the
+        only record of them.
+        """
+        await run_workflow(project)
+        code = record(runs(records_dir)[0], "prep")["code"]
+        assert [entry["role"] for entry in code] == ["script"]
+        assert code[0]["path"].endswith("prep.py")
+
+    async def test_the_digest_join_reproduces_the_declared_edge(
+        self, project: Path, records_dir: Path
+    ) -> None:
+        """
+        The whole design rests on this join closing.
+        """
+        await run_workflow(project)
+        run = runs(records_dir)[0]
+        produced = record(run, "prep")["outputs"][0]["sha256"]
+        consumed = record(run, "report")["inputs"][0]["sha256"]
+        assert produced == consumed
+
+
+@pytest.mark.usefixtures("horus_context", "init_registry")
+class TestTheSourceCopy:
+    """
+    The workflow's own YAML travels with the run.
+    """
+
+    async def test_a_yaml_workflow_is_copied_byte_for_byte(
+        self, project: Path, records_dir: Path
+    ) -> None:
+        """
+        The engine remembers the file it loaded, and the plan digests
+        the copy so a later edit to the original is detectable.
+        """
+        source = (project / "workflow.yaml").read_bytes()
+        await run_workflow(project)
+
+        run = runs(records_dir)[0]
+        assert (run / "workflow.yaml").read_bytes() == source
+        assert plan(run)["source"] == {
+            "file": "workflow.yaml",
+            "sha256": hashlib.sha256(source).hexdigest(),
+        }
+
+
+@pytest.mark.usefixtures("horus_context", "init_registry")
+class TestASkippedRun:
+    """
+    The common case in any workflow that is re-run.
+    """
+
+    async def test_a_second_run_gets_its_own_directory(
+        self, project: Path, records_dir: Path
+    ) -> None:
+        """
+        Re-runs never overwrite history.
+        """
+        await run_workflow(project)
+        await run_workflow(project)
+        assert len(runs(records_dir)) == EXPECTED_RUNS
+
+    async def test_skipped_tasks_are_still_recorded(
+        self, project: Path, records_dir: Path
+    ) -> None:
+        """
+        A skipped task never reaches the task middleware, so only the
+        target middleware can see it.
+        """
+        await run_workflow(project)
+        await run_workflow(project)
+        second = record(runs(records_dir)[1], "prep")
+        assert second["task"]["status"] == "skipped"
+        assert second["task"]["skip_reason"] == "complete"
+
+    async def test_a_skipped_record_still_joins(
+        self, project: Path, records_dir: Path
+    ) -> None:
+        """
+        Omitting digests here would break every edge through a cached
+        task, which is most of them in a re-run workflow.
+        """
+        await run_workflow(project)
+        await run_workflow(project)
+        run = runs(records_dir)[1]
+        assert record(run, "prep")["outputs"][0]["sha256"]
+        assert (
+            record(run, "prep")["outputs"][0]["sha256"]
+            == record(run, "report")["inputs"][0]["sha256"]
+        )
+
+    async def test_a_skipped_task_keeps_its_code_digests(
+        self, project: Path, records_dir: Path
+    ) -> None:
+        """
+        Without these, a changed script maps to none of the tasks that
+        use it, precisely because they were cached.
+        """
+        await run_workflow(project)
+        await run_workflow(project)
+        assert record(runs(records_dir)[1], "prep")["code"]
+
+
+@pytest.mark.usefixtures("horus_context", "init_registry")
+class TestDigestsSwitchedOff:
+    """
+    The one switch for cost-sensitive runs.
+    """
+
+    async def test_records_still_appear_and_say_what_is_missing(
+        self,
+        project: Path,
+        records_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        Report what was not captured, rather than looking complete.
+        """
+        monkeypatch.setenv("HORUS_LINEAGE_DIGESTS", "0")
+        await run_workflow(project)
+        prep = record(runs(records_dir)[0], "prep")
+        assert "digests_disabled" in prep["incomplete"]
+        assert "sha256" not in prep["outputs"][0]
+
+
+@pytest.mark.usefixtures("horus_context", "init_registry")
+class TestWhenThingsGoWrong:
+    """
+    The guarantees the observer makes about failure.
+    """
+
+    async def test_a_failing_task_is_recorded_as_failed(
+        self, project: Path, records_dir: Path
+    ) -> None:
+        """
+        The status is derived from the outcome, because the engine
+        assigns its own only after the chain returns.
+        """
+        (project / "prep.py").write_text("raise SystemExit(3)\n")
+        with pytest.raises(TaskExecutionError):
+            await run_workflow(project)
+        assert (
+            record(runs(records_dir)[0], "prep")["task"]["status"] == "failed"
+        )
+
+    async def test_a_broken_recorder_does_not_break_the_run(
+        self, project: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A recorder that can fail a run gets uninstalled the first time
+        it does.
+        """
+        monkeypatch.setattr(
+            "horus_lineage.record.build_task_record",
+            _explode,
+        )
+        await run_workflow(project)
+        assert (project / "results" / "prepared.txt").is_file()
+
+    async def test_an_unwritable_destination_does_not_break_the_run(
+        self, project: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A records directory that cannot be created is not the run's
+        problem.
+        """
+        monkeypatch.setenv("HORUS_LINEAGE_DIR", "/proc/nope/records")
+        await run_workflow(project)
+        assert (project / "results" / "prepared.txt").is_file()
+
+
+async def _explode(**_kwargs: Any) -> dict[str, Any]:
+    """
+    Stand-in for a recorder step that fails at the worst moment.
+    """
+    raise RuntimeError("the recorder is broken")
+
+
+@pytest.mark.usefixtures("horus_context", "init_registry")
+class TestPartialDigests:
+    """
+    Artifacts the engine cannot hash, such as folders and subworkflow
+    ports, leave a record with edges a reader will not see.
+    """
+
+    async def test_an_unhashable_output_is_reported(
+        self, project: Path, records_dir: Path
+    ) -> None:
+        """
+        Staying quiet here would let a reader treat an edgeless node as
+        complete rather than as partial.
+        """
+        as_folder = (
+            "- {id: report, name: Report, kind: folder, path: report_dir/}"
+        )
+        into_folder = (
+            'command: "mkdir -p $report && wc -l < $prepared > $report/n.txt"'
+        )
+        path = project / "workflow.yaml"
+        body = path.read_text()
+        body = body.replace(
+            "- {id: report, name: Report, kind: file, path: report.txt}",
+            as_folder,
+        )
+        body = body.replace(
+            'command: "wc -l < $prepared > $report"', into_folder
+        )
+        path.write_text(body)
+
+        await run_workflow(project)
+        report = record(runs(records_dir)[0], "report")
+
+        assert "sha256" not in report["outputs"][0]
+        assert report["incomplete"] == ["digests_partial"]
+
+    async def test_a_fully_digested_record_stays_clean(
+        self, project: Path, records_dir: Path
+    ) -> None:
+        """
+        A missing fingerprint manifest alone is not a gap, so the
+        ordinary case reports nothing.
+        """
+        await run_workflow(project)
+        assert record(runs(records_dir)[0], "prep")["incomplete"] == []
+
+
+@pytest.mark.usefixtures("horus_context", "init_registry")
+class TestLabels:
+    """
+    Domain metadata, carried from the workflow into the records.
+
+    This is what lets a reader answer "everything derived from subject X"
+    without knowing anything about the domain.
+    """
+
+    async def test_labels_reach_the_record(
+        self, project: Path, records_dir: Path
+    ) -> None:
+        """
+        An artifact labelled in the workflow is labelled in the record.
+        """
+        path = project / "workflow.yaml"
+        path.write_text(
+            path.read_text().replace(
+                "- {id: prepared, name: Prepared, kind: file, "
+                "path: prepared.txt}",
+                "- {id: prepared, name: Prepared, kind: file, "
+                "path: prepared.txt, labels: {subject: batch_017}}",
+                1,
+            )
+        )
+        await run_workflow(project)
+
+        outputs = record(runs(records_dir)[0], "prep")["outputs"]
+        assert outputs[0]["labels"] == {"subject": "batch_017"}
+
+    async def test_an_unlabelled_run_gains_no_empty_keys(
+        self, project: Path, records_dir: Path
+    ) -> None:
+        """
+        Records of a workflow that labels nothing read exactly as before.
+        """
+        await run_workflow(project)
+        prep = record(runs(records_dir)[0], "prep")
+        assert "labels" not in prep["outputs"][0]
+        assert "labels" not in prep["inputs"][0]
+
+
+@pytest.mark.usefixtures("horus_context", "init_registry")
+class TestTiming:
+    """
+    The engine's own task stamps, carried into the record.
+    """
+
+    async def test_an_executed_task_is_stamped(
+        self, project: Path, records_dir: Path
+    ) -> None:
+        """
+        Duration is the difference, wall clock.
+        """
+        await run_workflow(project)
+        task = record(runs(records_dir)[0], "prep")["task"]
+        assert task["started_at"] is not None
+        assert task["finished_at"] >= task["started_at"]
+
+    async def test_a_skipped_task_is_not(
+        self, project: Path, records_dir: Path
+    ) -> None:
+        """
+        Nothing ran, so there is nothing to time.
+        """
+        await run_workflow(project)
+        await run_workflow(project)
+        task = record(runs(records_dir)[1], "prep")["task"]
+        assert task["started_at"] is None
+        assert task["finished_at"] is None
+
+
+@pytest.mark.usefixtures("horus_context", "init_registry")
+class TestCommandSwitchedOff:
+    """
+    A workflow that passes a secret as an argument can opt out.
+    """
+
+    async def test_the_command_is_null(
+        self, project: Path, records_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Everything else in the record is unchanged.
+        """
+        monkeypatch.setenv(ENV_COMMAND, "0")
+        await run_workflow(project)
+        prep = record(runs(records_dir)[0], "prep")
+        assert prep["command"] is None
+        assert prep["outputs"][0]["sha256"]
+
+
+@pytest.mark.usefixtures("horus_context", "init_registry")
+class TestCancellation:
+    """
+    A run torn down partway still leaves what it knew.
+    """
+
+    async def test_a_cancelled_task_and_run_are_recorded_as_such(
+        self, project: Path, records_dir: Path
+    ) -> None:
+        """
+        Cancellation propagates and the status is derived in wrap, so
+        both records close as canceled.
+        """
+        (project / "prep.py").write_text("import time\ntime.sleep(30)\n")
+        workflow = BaseWorkflow.from_yaml(project / "workflow.yaml")
+        runner = asyncio.create_task(workflow.run(trigger_id="prep"))
+        await asyncio.sleep(1.0)
+        runner.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await runner
+
+        run = runs(records_dir)[0]
+        assert record(run, "prep")["task"]["status"] == "canceled"
+        assert plan(run)["status"] == "canceled"
+        assert plan(run)["finished_at"] is not None
