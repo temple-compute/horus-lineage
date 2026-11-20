@@ -29,6 +29,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, TypeVar
 
+from horus_runtime.core.task.status import TaskStatus
 from horus_runtime.core.workflow.base import BaseWorkflow
 from horus_runtime.core.workflow.status import WorkflowStatus
 from horus_runtime.logging import horus_logger
@@ -41,7 +42,11 @@ from horus_lineage import RECORD_FORMAT
 from horus_lineage.config import LineageConfig
 from horus_lineage.i18n import tr as _
 from horus_lineage.observer import observe
-from horus_lineage.record import code_files, project_definition
+from horus_lineage.record import (
+    build_task_record,
+    code_files,
+    project_definition,
+)
 from horus_lineage.session import (
     LineageSession,
     begin,
@@ -111,14 +116,46 @@ class LineageWorkflowMiddleware(WorkflowMiddleware):
         """
         Close the record out and drop the session, whatever happened.
         """
-        await observe("finish run.json", lambda: self._close(context, outcome))
         # Read the session before dropping it: the merge has to know
         # which task ids were actually recorded.
         session = current()
+        if session is not None:
+            await self._record_skipped(context.workflow, session)
+        await observe("finish run.json", lambda: self._close(context, outcome))
         if session is not None and session.config.merge:
             await observe("merge task records", lambda: self._merge(session))
         if token is not None:
             end(token)
+
+    @staticmethod
+    async def _record_skipped(
+        workflow: BaseWorkflow, session: LineageSession
+    ) -> None:
+        """
+        Record the tasks the scheduler skipped before dispatch.
+
+        Since horus-runtime 0.11 a task judged complete from its input
+        digests is skipped before placement, so neither the task nor the
+        target middleware sees it.
+        """
+        writer = RunWriter(session.directory)
+        for task in workflow.tasks:
+            if task.id in session.recorded:
+                continue
+            if task.status != TaskStatus.SKIPPED:
+                continue
+
+            async def body(task: Any = task) -> None:
+                record = await build_task_record(
+                    task=task,
+                    status=task.status,
+                    session=session,
+                    command=session.commands.pop(task.id, None),
+                )
+                session.recorded.add(task.id)
+                writer.write_task(task.id, record)
+
+            await observe(f"record skipped task {task.id}", body)
 
     async def _merge(self, session: LineageSession) -> None:
         """

@@ -28,6 +28,7 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from horus_runtime.core.artifact.store import ArtifactStore
 from horus_runtime.logging import horus_logger
@@ -317,8 +318,9 @@ async def build_task_record(
     return {
         "format": RECORD_FORMAT,
         "run": session.run,
-        # Private upstream, no public accessor yet. Lenient by design.
-        "execution": getattr(task, "_execution_id", None),
+        # Private upstream, no public accessor yet. Lenient by design. A
+        # task skipped before ``run()`` never gets one, so mint it here.
+        "execution": getattr(task, "_execution_id", None) or uuid4().hex,
         "definition_sha256": session.definition_sha256,
         "recorded_at": now(),
         "task": {

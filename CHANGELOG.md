@@ -16,6 +16,8 @@ unchanged.
   CI, release and scanning.
 - Remove the ADRs. The record format is described in the README.
 - Add SECURITY.md, CONTRIBUTING.md, dependabot and an issue template.
+- Record tasks that horus-runtime 0.11 skips before dispatch.
+- Test against horus-runtime 0.11, which digests folder outputs.
 
 ## 0.1.0 - 2026-09-03
 
