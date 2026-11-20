@@ -435,12 +435,12 @@ class TestPartialDigests:
     ports, leave a record with edges a reader will not see.
     """
 
-    async def test_an_unhashable_output_is_reported(
+    async def test_a_folder_output_is_digested(
         self, project: Path, records_dir: Path
     ) -> None:
         """
-        Staying quiet here would let a reader treat an edgeless node as
-        complete rather than as partial.
+        The engine digests folders since horus-runtime 0.11, so a folder
+        output joins like a file.
         """
         as_folder = (
             "- {id: report, name: Report, kind: folder, path: report_dir/}"
@@ -462,8 +462,8 @@ class TestPartialDigests:
         await run_workflow(project)
         report = record(runs(records_dir)[0], "report")
 
-        assert "sha256" not in report["outputs"][0]
-        assert report["incomplete"] == ["digests_partial"]
+        assert report["outputs"][0]["sha256"].startswith("deep:")
+        assert report["incomplete"] == []
 
     async def test_a_fully_digested_record_stays_clean(
         self, project: Path, records_dir: Path
