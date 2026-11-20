@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 - unreleased
+## 0.2.0 - 2026-11-20
 
 Breaking: records now go under the workflow's run directory,
 `<run-directory>/.horus-lineage/<run>/`, instead of `~/.horus-lineage/`.
